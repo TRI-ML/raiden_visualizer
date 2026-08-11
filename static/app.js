@@ -16,6 +16,9 @@ const state = {
   episode: null,
   facts: {},        // episode -> { timestamp, status } for the browse list labels
   detail: null,
+  overviewTasks: [], // per-task rows from /overview (counts + collection span)
+  taskSort: "episodes",  // Tasks-card sort: episodes | collected | name
+  hoursInputs: null,     // last /stats pass, so a re-sort can refill the hours cells
   eye: "left",
   tiles: [],        // { camera, video, onReady } for each grid cell with video
   master: null,     // the video element that drives the shared timeline
@@ -108,6 +111,14 @@ async function init() {
     document.querySelectorAll("#teacher-metric-toggle button").forEach((x) => x.classList.toggle("active", x === b));
     drawTeachers(b.dataset.metric);
   });
+  // Tasks-card sort (Episodes / Collected / Name) — re-sorts the loaded rows, no refetch.
+  $("#ov-task-sort").addEventListener("click", (ev) => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    document.querySelectorAll("#ov-task-sort button").forEach((x) => x.classList.toggle("active", x === b));
+    state.taskSort = b.dataset.sort;
+    renderTaskList();
+  });
   // Episode navigation: prev/next buttons, slider scrub, and ←/→ arrow keys.
   $("#ep-prev").addEventListener("click", () => stepEpisode(-1));
   $("#ep-next").addEventListener("click", () => stepEpisode(1));
@@ -137,6 +148,7 @@ async function init() {
 async function selectSource(sid, autoTask = null, autoEpisode = null) {
   state.source = sid;
   state.episode = null;
+  state.hoursInputs = null;   // the previous dataset's per-task hours don't apply here
   clearTimeout(state._catTimer);   // stop catalog polling once we enter a source
   document.body.classList.remove("catalog-mode");  // reveal the episode-browser sidebar
   $("#catalog-view").classList.add("hidden");
@@ -658,34 +670,83 @@ async function renderOverview() {
       stats.appendChild(c);
     }
 
-    const maxEp = Math.max(1, ...ov.tasks.map((t) => t.episodes));
-    const list = $("#ov-task-list");
-    list.innerHTML = "";
-    $("#ov-task-hint").textContent = `${ov.num_tasks} total`;
-    ov.tasks.forEach((t) => {
-      const row = el("div", "ov-task-row");
-      row.appendChild(el("div", "t-name", t.task));
-      const bar = el("div", "t-bar");
-      const fill = el("i");
-      fill.style.width = `${(t.episodes / maxEp) * 100}%`;
-      bar.appendChild(fill);
-      row.appendChild(bar);
-      row.appendChild(el("div", "t-count", `${t.episodes} ep`));
-      // Per-task hours — filled in by updateHoursCard once /api/stats loads.
-      const hrs = el("div", "t-hours", "…");
-      hrs.dataset.task = t.task;
-      row.appendChild(hrs);
-      const latest = t.latest ? parseEpisodeName(t.latest).when || "" : "";
-      row.appendChild(el("div", "t-latest", latest ? latest.split(" · ")[0] : ""));
-      row.onclick = () => selectTask(t.task);
-      list.appendChild(row);
-    });
-
     state.overviewTasks = ov.tasks;  // per-task totals, for extrapolating hours
+    state.numTasks = ov.num_tasks;
+    renderTaskList();
     renderAnalytics(ov.tasks.map((t) => t.task));
   } catch (e) {
     toast("Failed to load overview: " + e.message);
   }
+}
+
+/* ---------------- Overview: per-task breakdown ---------------- */
+
+// Sort comparators for the Tasks card. "collected" is newest-collected first (the
+// useful direction: what was recorded most recently); tasks whose format carries no
+// timestamp sort last so they never displace dated ones.
+const TASK_SORTS = {
+  episodes: (a, b) => b.episodes - a.episodes,
+  name: (a, b) => a.task.localeCompare(b.task),
+  collected: (a, b) => {
+    const av = a.collected_end || "", bv = b.collected_end || "";
+    if (!av && !bv) return b.episodes - a.episodes;
+    if (!av) return 1;
+    if (!bv) return -1;
+    return bv.localeCompare(av);   // ISO8601 sorts lexicographically
+  },
+};
+
+function renderTaskList() {
+  const tasks = state.overviewTasks || [];
+  const list = $("#ov-task-list");
+  list.innerHTML = "";
+  const mode = state.taskSort || "episodes";
+  // Hide the Collected sort where the format has no capture timestamps (LeRobot):
+  // offering a sort that can't order anything would just look broken.
+  const anyDated = tasks.some((t) => t.collected_end);
+  $("#ov-task-sort").classList.toggle("hidden", !anyDated);
+  const sorted = tasks.slice().sort(TASK_SORTS[mode] || TASK_SORTS.episodes);
+  $("#ov-task-hint").textContent = `${state.numTasks ?? tasks.length} total`;
+  const maxEp = Math.max(1, ...tasks.map((t) => t.episodes));
+  sorted.forEach((t) => {
+    const row = el("div", "ov-task-row");
+    row.appendChild(el("div", "t-name", t.task));
+    const bar = el("div", "t-bar");
+    const fill = el("i");
+    fill.style.width = `${(t.episodes / maxEp) * 100}%`;
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    row.appendChild(el("div", "t-count", `${t.episodes} ep`));
+    // Per-task hours — filled in by updateHoursCard once /api/stats loads.
+    const hrs = el("div", "t-hours", "…");
+    hrs.dataset.task = t.task;
+    row.appendChild(hrs);
+    row.appendChild(taskWhenCell(t));
+    row.onclick = () => selectTask(t.task);
+    list.appendChild(row);
+  });
+  // Rows were rebuilt, so their hours cells are back to "…" — refill from the last
+  // stats pass if it already landed (a re-sort must not lose them).
+  const h = state.hoursInputs;
+  if (h) updatePerTaskHours(h.eps, h.stats, h.estimated);
+}
+
+// The date cell: the collection span from the backend (start–end, or a single date
+// for a one-day task), falling back to the date parsed out of the latest episode's
+// name for formats that report no timestamps.
+function taskWhenCell(t) {
+  const start = t.collected_start ? t.collected_start.slice(0, 10) : null;
+  const end = t.collected_end ? t.collected_end.slice(0, 10) : null;
+  if (!start && !end) {
+    const parsed = t.latest ? parseEpisodeName(t.latest).when : null;
+    return el("div", "t-latest", parsed ? parsed.split(" · ")[0] : "");
+  }
+  // Show a range only when both ends are known AND differ; a single known bound (or a
+  // same-day task) shows one date rather than a half-empty arrow.
+  const text = (start && end && start !== end) ? `${start} → ${end}` : (end || start);
+  const cell = el("div", "t-latest", text);
+  cell.title = `collected ${t.collected_start || "unknown"} → ${t.collected_end || "unknown"}`;
+  return cell;
 }
 
 /* ---------------- Overview analytics charts ---------------- */
@@ -780,6 +841,9 @@ function updateHoursCard(eps, stats) {
 // Fill the per-task hours cells. For sampled sources, scale each task's own
 // sampled mean by its full episode count (from the overview's per-task totals).
 function updatePerTaskHours(eps, stats, estimated) {
+  // Stashed so re-sorting the Tasks card (which rebuilds the rows) can refill the
+  // cells without refetching stats.
+  state.hoursInputs = { eps, stats, estimated };
   const byTask = {};  // task -> {sum, n}
   eps.forEach((e) => {
     const b = byTask[e.task] || (byTask[e.task] = { sum: 0, n: 0 });

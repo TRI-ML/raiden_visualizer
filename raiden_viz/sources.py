@@ -128,6 +128,12 @@ class Source:
         to offer return {} and the sidebar just shows indices."""
         return {}
 
+    def episode_time(self, task: str, episode: str) -> str | None:
+        """Capture wallclock (ISO8601) of ONE episode, as cheaply as the format
+        allows — overview() calls it twice per task (first + last) to date the task.
+        None where the format carries no timestamp."""
+        return None
+
     def video_path(self, task: str, episode: str, camera: str, eye: str) -> Path:
         raise NotImplementedError
 
@@ -146,13 +152,63 @@ class Source:
                 m = re.match(r"^([A-Za-z][\w-]*)_\d{4}-\d{2}-\d{2}T", ep)
                 if m:
                     stations.add(m.group(1))
-            per_task.append({"task": task, "episodes": len(eps), "latest": latest})
+            per_task.append({"task": task, "episodes": len(eps), "latest": latest,
+                             "_eps": eps})
         per_task.sort(key=lambda t: t["episodes"], reverse=True)
+        self._add_collection_span(per_task)
         return {
             "source": self.id, "bucket": self.bucket, "prefix": self.prefix,
             "num_tasks": len(tasks), "num_episodes": total,
             "stations": sorted(stations), "tasks": per_task,
         }
+
+    # How many episodes to try inward from each end of a task before giving up on
+    # dating it. Episode lists are chronological, so the first/last episode normally
+    # answers it in one read — but an episode can be missing its metadata (an aborted
+    # recording leaves the directory behind), which would otherwise blank the date.
+    SPAN_PROBE_DEPTH = 3
+
+    def _add_collection_span(self, per_task: list[dict]) -> None:
+        """Stamp each task row with when it was collected: ``collected_start`` /
+        ``collected_end`` (ISO8601, None where the format has no timestamps).
+
+        Episode lists are chronological, so a task's span is its first and last
+        episode — a couple of cheap reads per task instead of one per episode. Reads
+        run in parallel across tasks; a source without timestamps leaves every value
+        None (episode_time returns None) and the frontend hides the sort.
+        """
+        jobs = []
+        for row in per_task:
+            eps = row.pop("_eps")
+            d = self.SPAN_PROBE_DEPTH
+            for key, candidates in (("collected_start", eps[:d]),
+                                    ("collected_end", eps[::-1][:d])):
+                row[key] = None
+                if candidates:
+                    jobs.append((row, key, candidates))
+        if not jobs:
+            return
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            times = pool.map(lambda j: self._first_time(j[2], j[0]["task"]), jobs)
+        for (row, key, _), ts in zip(jobs, times):
+            row[key] = ts
+
+    def _first_time(self, episodes: list[str], task: str) -> str | None:
+        """The first readable timestamp among ``episodes``, in order (they're ordered
+        outermost-first, so this walks inward from one end of the task)."""
+        for ep in episodes:
+            ts = self._safe_episode_time(task, ep)
+            if ts:
+                return ts
+        return None
+
+    def _safe_episode_time(self, task, episode) -> str | None:
+        """episode_time that never breaks the overview: one unreadable episode just
+        leaves that end of the span unknown."""
+        try:
+            return self.episode_time(task, episode)
+        except Exception:
+            return None
 
     # Per-source cap on how many episodes a *quick* (non-full) stats pass samples.
     # Reading one stat is cheap, but datasets can have tens of thousands of
@@ -288,6 +344,12 @@ class RaidenSource(Source):
     def _ep_prefix(self, task, episode):
         return f"{self.prefix}/{task}/{episode}"
 
+    def episode_time(self, task: str, episode: str) -> str | None:
+        # The recorder's own capture stamp, from the ~1 KB metadata.json (via the
+        # etag-keyed stat cache, so the overview's reads are paid once).
+        rec = self._safe_stat(task, episode)
+        return rec.get("timestamp") if rec else None
+
     def episode_facts(self, task: str) -> dict:
         # metadata.json is ~1 KB, so fetching one per episode in parallel is cheap
         # enough to label the whole browse list (largest raiden task is ~270 eps).
@@ -416,6 +478,12 @@ class YamMcapSource(Source):
     # are a browsing nicety, not worth paging tens of thousands of keys (ABC-130k's
     # largest task has ~11k episodes) on every task switch.
     FACTS_MAX_EPISODES = 2000
+
+    def episode_time(self, task: str, episode: str) -> str | None:
+        # A HEAD on the MCAP: no download, and its LastModified is the closest
+        # available wallclock stamp (uuid episode ids carry no time).
+        obj = s3.try_head(self._mcap_key(task, episode), bucket=self.bucket)
+        return obj.last_modified if obj else None
 
     def episode_facts(self, task: str) -> dict:
         # uuid-named episodes carry no timestamp, and the MCAP is far too big to
