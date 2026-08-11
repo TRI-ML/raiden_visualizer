@@ -5,8 +5,9 @@ Source subclass exposing the same methods, so the API routes and the frontend ar
 format-agnostic:
 
     list_tasks()                    -> [task, ...]
-    list_episodes(task)             -> [episode, ...]   (newest first)
+    list_episodes(task)             -> [episode, ...]   (oldest first)
     episode_detail(task, episode)   -> {instruction, status, cameras[], robot, ...}
+    episode_facts(task)             -> {episode: {timestamp, status}}  (cheap)
     video_path(task, episode, cam)  -> local Path to a decoded MP4
     episode_stat(task, episode)     -> compact record for analytics
     overview() / stats()            -> dataset-wide aggregates
@@ -108,12 +109,24 @@ class Source:
         return s3.list_dirs(self.prefix, bucket=self.bucket)
 
     def list_episodes(self, task: str) -> list[str]:
+        # Oldest first, matching how the raiden recorder numbers episodes on disk
+        # (0000, 0001, ... in capture order) so viewer index == recording index.
+        # Both naming schemes sort chronologically as strings: zero-padded counters
+        # (0000/0001) and station_<ISO-timestamp> dirs.
         eps = s3.list_dirs(f"{self.prefix}/{task}", bucket=self.bucket)
-        return sorted(eps, reverse=True)
+        return sorted(eps)
 
     # ---- per-source ----
     def episode_detail(self, task: str, episode: str) -> dict:
         raise NotImplementedError
+
+    def episode_facts(self, task: str) -> dict:
+        """Cheap per-episode facts for the browse list: {episode: {timestamp, status}}.
+
+        Must stay listing-cheap (no per-episode GETs unless they're small): this is
+        called on every task switch to label the sidebar. Sources with nothing cheap
+        to offer return {} and the sidebar just shows indices."""
+        return {}
 
     def video_path(self, task: str, episode: str, camera: str, eye: str) -> Path:
         raise NotImplementedError
@@ -128,7 +141,7 @@ class Source:
         for task in tasks:
             eps = self.list_episodes(task)
             total += len(eps)
-            latest = eps[0] if eps else None
+            latest = eps[-1] if eps else None  # lists are oldest-first
             for ep in eps:
                 m = re.match(r"^([A-Za-z][\w-]*)_\d{4}-\d{2}-\d{2}T", ep)
                 if m:
@@ -275,6 +288,19 @@ class RaidenSource(Source):
     def _ep_prefix(self, task, episode):
         return f"{self.prefix}/{task}/{episode}"
 
+    def episode_facts(self, task: str) -> dict:
+        # metadata.json is ~1 KB, so fetching one per episode in parallel is cheap
+        # enough to label the whole browse list (largest raiden task is ~270 eps).
+        # Reuses the etag-keyed stat cache, so repeat visits are served from disk.
+        eps = self.list_episodes(task)
+        out = {}
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            recs = pool.map(lambda e: (e, self._safe_stat(task, e)), eps)
+        for ep, rec in recs:
+            if rec:
+                out[ep] = {"timestamp": rec.get("timestamp"), "status": rec.get("status")}
+        return out
+
     def episode_detail(self, task, episode):
         prefix = self._ep_prefix(task, episode)
         metadata = s3.get_json(f"{prefix}/metadata.json", bucket=self.bucket)
@@ -385,6 +411,27 @@ class YamMcapSource(Source):
     def _mcap_key(self, task, episode):
         name = self.spec.get("mcap_name", "output.mcap")
         return f"{self.prefix}/{task}/{episode}/{name}"
+
+    # Skip the browse-list timestamp listing for tasks bigger than this: the labels
+    # are a browsing nicety, not worth paging tens of thousands of keys (ABC-130k's
+    # largest task has ~11k episodes) on every task switch.
+    FACTS_MAX_EPISODES = 2000
+
+    def episode_facts(self, task: str) -> dict:
+        # uuid-named episodes carry no timestamp, and the MCAP is far too big to
+        # open here — but a single recursive listing yields every episode's MCAP
+        # LastModified, the closest available wallclock stamp. No status: the MCAP
+        # format has no success/failure field.
+        # Size-check on the cheaper delimiter listing first, so an oversized task
+        # bails without paying for the recursive walk.
+        if len(self.list_episodes(task)) > self.FACTS_MAX_EPISODES:
+            return {}
+        name = self.spec.get("mcap_name", "output.mcap")
+        out = {}
+        for obj in s3.list_keys(f"{self.prefix}/{task}", bucket=self.bucket, suffix=name):
+            ep = obj.key[len(f"{self.prefix}/{task}/"):].rsplit("/", 1)[0]
+            out[ep] = {"timestamp": obj.last_modified, "status": None}
+        return out
 
     def _mine(self, obj, task=None, episode=None) -> dict:
         """Download the raw MCAP to a TEMP file, extract everything (all camera
@@ -723,8 +770,8 @@ class LeRobotSingleRootSource(LeRobotSource):
 
     def list_episodes(self, task: str) -> list[str]:
         idxs = self._meta()["by_task"].get(task, [])
-        # newest-first to match the other sources' ordering
-        return [self._ep_name(i) for i in sorted(idxs, reverse=True)]
+        # oldest-first (ascending episode_index) to match the other sources' ordering
+        return [self._ep_name(i) for i in sorted(idxs)]
 
     def _row(self, task: str, episode: str) -> tuple[dict, dict]:
         meta = self._meta()

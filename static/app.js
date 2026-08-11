@@ -14,6 +14,7 @@ const state = {
   task: null,
   episodes: [],
   episode: null,
+  facts: {},        // episode -> { timestamp, status } for the browse list labels
   detail: null,
   eye: "left",
   tiles: [],        // { camera, video, onReady } for each grid cell with video
@@ -1140,17 +1141,32 @@ function niceTicks(lo, hi, count) {
 
 async function selectTask(task, autoEpisode = null) {
   state.task = task;
+  state.facts = {};
   $("#task-select").value = task;
   try {
     const { episodes } = await api(`${apiBase()}/tasks/${encodeURIComponent(task)}/episodes`);
     state.episodes = episodes;
     renderEpisodeList();
+    loadEpisodeFacts(task);   // fills in timestamps/status when it lands
     if (autoEpisode && episodes.includes(autoEpisode)) {
       await selectEpisode(autoEpisode);
     }
   } catch (e) {
     toast("Failed to load episodes: " + e.message);
   }
+}
+
+// Timestamp + success/failure per episode, for the sidebar rows. Fetched after the
+// list renders (it can take a few seconds on a big task) and never fatal: a failure
+// or an unsupported source just leaves the rows showing indices only. Stamped with
+// the task it was requested for so a fast task switch can't apply stale labels.
+async function loadEpisodeFacts(task) {
+  try {
+    const r = await api(`${apiBase()}/tasks/${encodeURIComponent(task)}/episode-facts`);
+    if (state.task !== task) return;
+    state.facts = r.facts || {};
+    renderEpisodeList();
+  } catch (_) { /* labels are optional */ }
 }
 
 // Episode lists can be very large (YAM tasks have >1000). Cap the rendered rows
@@ -1161,18 +1177,34 @@ function renderEpisodeList() {
   const filter = $("#episode-search").value.toLowerCase();
   const list = $("#episode-list");
   list.innerHTML = "";
-  // Index is the episode's stable position in the task list (newest = #1), so it
-  // doesn't renumber as the search box narrows the visible rows.
+  // Index is the episode's stable position in the task list — ZERO-based, oldest
+  // first, so it matches the episode numbering raiden itself records on disk
+  // (0000, 0001, ...). Computed off the full list so it doesn't renumber as the
+  // search box narrows the visible rows.
   const matched = state.episodes
-    .map((ep, i) => ({ ep, idx: i + 1 }))
+    .map((ep, i) => ({ ep, idx: i }))
     .filter(({ ep }) => ep.toLowerCase().includes(filter));
   const shown = matched.slice(0, EPISODE_RENDER_CAP);
   $("#episode-count").textContent = matched.length;
+  const width = String(Math.max(0, state.episodes.length - 1)).length;
   shown.forEach(({ ep, idx }) => {
     const li = el("li");
     li.classList.toggle("active", ep === state.episode);
-    // Simplified sidebar: just the index — no station, no timestamp.
-    li.appendChild(el("div", "ep-li-idx mono", `#${idx}`));
+    const head = el("div", "ep-li-head");
+    // Zero-padded to the task's widest index so the rows form a clean column.
+    head.appendChild(el("div", "ep-li-idx mono", String(idx).padStart(width, "0")));
+    const f = (state.facts || {})[ep];
+    const st = (f && f.status ? f.status : "").toLowerCase();
+    if (st) {
+      const badge = el("div", "ep-li-status " + statusClass(st), statusMark(st));
+      badge.title = f.status;
+      head.appendChild(badge);
+    }
+    li.appendChild(head);
+    // Timestamp: from the metadata when we have it, else parsed out of the
+    // episode's own name (raiden dirs are station_<ISO timestamp>).
+    const when = (f && f.timestamp) ? formatStamp(f.timestamp) : parseEpisodeName(ep).when;
+    if (when) li.appendChild(el("div", "ep-li-when mono", when));
     li.onclick = () => selectEpisode(ep);
     list.appendChild(li);
   });
@@ -1181,6 +1213,25 @@ function renderEpisodeList() {
     more.style.pointerEvents = "none";
     list.appendChild(more);
   }
+}
+
+// success/failure/pending -> the status-badge palette already used on the detail page.
+function statusClass(st) {
+  if (st === "success") return "success";
+  if (st === "failure" || st === "fail") return "failure";
+  return "neutral";
+}
+
+// A compact glyph rather than the word, to fit the sidebar row (title carries the word).
+function statusMark(st) {
+  return st === "success" ? "✓" : (st === "failure" || st === "fail") ? "✕" : "•";
+}
+
+// "2026-08-04T17:19:47.275092" -> "2026-08-04 · 17:19:47" (no Date parsing: these are
+// local wallclock stamps with no zone, and Date would re-interpret them).
+function formatStamp(ts) {
+  const m = String(ts).match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+  return m ? `${m[1]} · ${m[2]}` : null;
 }
 
 // Episode names are either "station_2026-06-30T17-19-12..." (raiden) or
@@ -1229,16 +1280,19 @@ function updateEpisodeNav() {
   const prev = $("#ep-prev");
   const next = $("#ep-next");
   if (i < 0 || !n) {
-    pos.textContent = "0 / 0";
+    pos.textContent = "— / —";
     slider.max = "0"; slider.value = "0"; slider.disabled = true;
     prev.disabled = next.disabled = true;
     return;
   }
   slider.disabled = false;
   slider.max = String(n - 1);
-  // Slider left→right = first→last in the task list (which is newest→oldest).
+  // Slider left→right = first→last in the task list (which is oldest→newest).
   slider.value = String(i);
-  pos.textContent = `${i + 1} / ${n}`;
+  // Zero-based index / highest index, zero-padded to match the sidebar labels (and
+  // raiden's own numbering) — "ep" makes it read as an index, not an Nth-of-M count.
+  const w = String(n - 1).length;
+  pos.textContent = `ep ${String(i).padStart(w, "0")} / ${n - 1}`;
   prev.disabled = i === 0;
   next.disabled = i === n - 1;
 }
